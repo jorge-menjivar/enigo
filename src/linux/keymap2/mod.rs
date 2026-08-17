@@ -254,7 +254,7 @@ impl Keymap2 {
         let keysym = Keysym::from(key);
         let key_name = format!("{keysym:?}");
 
-        (self.keymap.min_keycode().raw()..self.keymap.max_keycode().raw())
+        (self.keymap.min_keycode().raw()..=self.keymap.max_keycode().raw())
             .find(|&k| {
                 let keycode = Keycode::new(k);
                 let keysym = self.state.key_get_one_sym(keycode);
@@ -270,7 +270,48 @@ impl Keymap2 {
             Some(key_name) => key_name,
             None => &key_name,
         };
-        self.parsed_keymap.map_key(key_name, true)
+        let keycode = self.parsed_keymap.map_key(key_name, true)?;
+        self.recompile().map_err(|()| {
+            InputError::Mapping("unable to compile the updated keymap".to_string())
+        })?;
+        Ok(keycode)
+    }
+
+    fn recompile(&mut self) -> Result<(), ()> {
+        let depressed_mods = self.state.serialize_mods(STATE_MODS_DEPRESSED);
+        let latched_mods = self.state.serialize_mods(STATE_MODS_LATCHED);
+        let locked_mods = self.state.serialize_mods(STATE_MODS_LOCKED);
+
+        let depressed_layout = self.state.serialize_layout(STATE_LAYOUT_DEPRESSED);
+        let latched_layout = self.state.serialize_layout(STATE_LAYOUT_LATCHED);
+        let locked_layout = self.state.serialize_layout(STATE_LAYOUT_LOCKED);
+
+        let keymap = Keymap::new_from_string(
+            &self.context,
+            self.parsed_keymap.to_string(),
+            KEYMAP_FORMAT_TEXT_V1,
+            KEYMAP_COMPILE_NO_FLAGS,
+        )
+        .ok_or_else(|| {
+            error!("unable to compile the updated keymap with xkbcommon");
+        })?;
+
+        let mut state = State::new(&keymap);
+        for key in &self.pressed_keys {
+            state.update_key(*key, KeyDirection::Down);
+        }
+        state.update_mask(
+            depressed_mods,
+            latched_mods,
+            locked_mods,
+            depressed_layout,
+            latched_layout,
+            locked_layout,
+        );
+
+        self.keymap = keymap;
+        self.state = state;
+        Ok(())
     }
 
     pub fn unmap_everything(&mut self) -> InputResult<()> {
@@ -366,5 +407,50 @@ impl Keymap2 {
         let context = Context::new(CONTEXT_NO_FLAGS);
 
         Self::new_from_fd(context, format, keymap_file.into(), size)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::Write as _;
+
+    use xkbcommon::xkb::{
+        CONTEXT_NO_FLAGS, Context, KEYMAP_COMPILE_NO_FLAGS, KEYMAP_FORMAT_TEXT_V1, Keymap,
+    };
+
+    use super::Keymap2;
+    use crate::Key;
+
+    fn us_keymap() -> Keymap2 {
+        let context = Context::new(CONTEXT_NO_FLAGS);
+        let keymap =
+            Keymap::new_from_names(&context, "", "", "us", "", None, KEYMAP_COMPILE_NO_FLAGS)
+                .expect("compiling a us keymap requires the xkb data files");
+        let keymap_string = keymap.get_as_string(KEYMAP_FORMAT_TEXT_V1);
+        let mut file = tempfile::tempfile().unwrap();
+        write!(file, "{keymap_string}\0").unwrap();
+        let size = file.metadata().unwrap().len().try_into().unwrap();
+        Keymap2::new_from_fd(context, KEYMAP_FORMAT_TEXT_V1, file.into(), size).unwrap()
+    }
+
+    // After a key is dynamically mapped, the compiled keymap must reflect the
+    // mapping immediately, without waiting for the compositor to echo the
+    // uploaded keymap back. The echoes lag behind the uploads, so relying on
+    // them lets lookups and later mappings operate on stale state.
+    #[test]
+    fn unit_mapped_key_is_found_without_compositor_echo() {
+        let mut keymap = us_keymap();
+
+        let key = Key::Unicode('汉');
+        assert_eq!(keymap.key_to_keycode(key), None, "precondition: not mapped");
+        let keycode = keymap.map_key(key).unwrap();
+        assert_eq!(keymap.key_to_keycode(key), Some(keycode));
+
+        // A second mapping must not displace the first one.
+        let key2 = Key::Unicode('语');
+        let keycode2 = keymap.map_key(key2).unwrap();
+        assert_ne!(keycode, keycode2);
+        assert_eq!(keymap.key_to_keycode(key), Some(keycode));
+        assert_eq!(keymap.key_to_keycode(key2), Some(keycode2));
     }
 }

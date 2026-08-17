@@ -255,6 +255,7 @@ impl Con {
             .format_file_size()
             .map_err(|()| InputError::Mapping("could not update the keymap".to_string()))?;
         vk.keymap(format, keymap_file.as_fd(), size);
+        self.state.own_keymap = true;
 
         debug!("wait for response after keymap call");
         self.event_queue
@@ -319,6 +320,11 @@ struct WaylandState {
     seat: Option<wl_seat::WlSeat>,
     seat_keyboard: Option<WlKeyboard>,
     seat_keymap: Option<Keymap2>,
+    /// Whether the virtual keyboard has uploaded its own keymap. Once it has,
+    /// the seat's `wl_keyboard::Event::Keymap` events are just the compositor
+    /// echoing our uploads back (recompiled and delayed), so they must not
+    /// overwrite `seat_keymap`.
+    own_keymap: bool,
     seat_pointer: Option<WlPointer>,
 }
 
@@ -340,6 +346,7 @@ impl WaylandState {
             seat: None,
             seat_keyboard: None,
             seat_keymap: None,
+            own_keymap: false,
             seat_pointer: None,
         }
     }
@@ -688,6 +695,15 @@ impl Dispatch<wl_keyboard::WlKeyboard, ()> for WaylandState {
                 debug!(
                     "WlKeyboard received event:\nwl_keyboard::Event::Keymap {{ {format:?}, {fd:?}, {size} }}"
                 );
+
+                // Once the virtual keyboard has uploaded its own keymap, these
+                // events are the compositor echoing our uploads back
+                // (recompiled and delayed). Applying them would clobber
+                // dynamic mappings with stale state, so wrong characters
+                // would get typed when a cached keycode is pressed later.
+                if state.own_keymap && state.seat_keymap.is_some() {
+                    return;
+                }
 
                 // Get the received format
                 let format = if let WEnum::Value(format) = format {
