@@ -3,9 +3,9 @@ use std::{collections::HashSet, fs::File, io::Write as _, os::fd::OwnedFd};
 use log::{debug, error, trace};
 use xkbcommon::xkb::{
     CONTEXT_NO_FLAGS, Context, KEYMAP_COMPILE_NO_FLAGS, KEYMAP_FORMAT_TEXT_V1, KeyDirection,
-    Keycode, Keymap, KeymapFormat, LayoutIndex, LayoutMask, ModMask, STATE_LAYOUT_DEPRESSED,
-    STATE_LAYOUT_EFFECTIVE, STATE_LAYOUT_LATCHED, STATE_LAYOUT_LOCKED, STATE_MODS_DEPRESSED,
-    STATE_MODS_LATCHED, STATE_MODS_LOCKED, State,
+    Keycode, Keymap, KeymapFormat, LayoutIndex, LayoutMask, LevelIndex, ModMask,
+    STATE_LAYOUT_DEPRESSED, STATE_LAYOUT_EFFECTIVE, STATE_LAYOUT_LATCHED, STATE_LAYOUT_LOCKED,
+    STATE_MODS_DEPRESSED, STATE_MODS_LATCHED, STATE_MODS_LOCKED, State,
 };
 use xkeysym::Keysym;
 
@@ -250,17 +250,101 @@ impl Keymap2 {
         Ok((format, keymap_file, size))
     }
 
-    pub fn key_to_keycode(&self, key: Key) -> Option<u16> {
+    /// Find a key on the current keymap that produces `key`, together with the
+    /// modifiers needed to reach the shift level it sits on.
+    ///
+    /// Searching level by level rather than keycode by keycode is what makes
+    /// the result the *cheapest* way to type the keysym: a key that needs no
+    /// modifier always wins over one that does, whatever order the keycodes
+    /// happen to fall in.
+    ///
+    /// Looking at level 0 alone — which is all `xkb_state_key_get_one_sym`
+    /// reports while no modifier is held — misses every shifted character. On a
+    /// US layout that is all of `A`-`Z` and `! " # % & * + : > ? @ ^ _ { | } ~`,
+    /// none of which appear unshifted on any key. Each miss then fell through
+    /// to [`Self::map_key`], which appends a keycode to the keymap and makes the
+    /// caller upload the whole thing mid-sentence; a standard keymap has no free
+    /// keycode below 256, so the invented one starts at 257 and is dropped
+    /// outright by X11 clients (keycodes are a `CARD8` there) and raced against
+    /// the keymap upload by Wayland ones. Either way the character silently
+    /// vanished.
+    pub fn key_to_keycode(&self, key: Key) -> Option<(u16, ModMask)> {
         let keysym = Keysym::from(key);
-        let key_name = format!("{keysym:?}");
+        let min = self.keymap.min_keycode().raw();
+        let max = self.keymap.max_keycode().raw();
 
-        (self.keymap.min_keycode().raw()..=self.keymap.max_keycode().raw())
-            .find(|&k| {
-                let keycode = Keycode::new(k);
-                let keysym = self.state.key_get_one_sym(keycode);
-                format!("{keysym:?}") == key_name
-            })
-            .and_then(|k| u16::try_from(k).ok())
+        // Keys do not all have the same number of levels, so the loop runs
+        // until no key has a level this deep rather than up to a fixed depth.
+        for level in 0.. {
+            let mut level_exists = false;
+
+            for raw in min..=max {
+                let keycode = Keycode::new(raw);
+                // The active group only: reaching a keysym by switching layout
+                // would leave the user on a different one than they started on.
+                let layout = self.state.key_get_layout(keycode);
+                let syms = self.keymap.key_get_syms_by_level(keycode, layout, level);
+                if syms.is_empty() {
+                    continue;
+                }
+                level_exists = true;
+
+                // One keysym exactly. A level that emits several would type the
+                // others alongside the one asked for.
+                if syms != [keysym] {
+                    continue;
+                }
+                let Ok(keycode_u16) = u16::try_from(raw) else {
+                    continue;
+                };
+                let Some(mods) = self.mods_for_level(keycode, layout, level) else {
+                    // No modifier combination reaches this level, so the key is
+                    // there but unreachable. Keep looking.
+                    continue;
+                };
+                trace!("keysym {keysym:?} is on keycode {raw} at level {level} (mods {mods:#x})");
+                return Some((keycode_u16, mods));
+            }
+
+            if !level_exists {
+                return None;
+            }
+        }
+
+        None
+    }
+
+    /// The fewest modifiers that select `level` on this key, if any do.
+    fn mods_for_level(
+        &self,
+        keycode: Keycode,
+        layout: LayoutIndex,
+        level: LevelIndex,
+    ) -> Option<ModMask> {
+        // Four is room for every combination a sane layout offers; a key that
+        // needs more simply loses the alternatives that did not fit, and the
+        // ones kept are still correct.
+        let mut masks = [ModMask::default(); 4];
+        let found = self
+            .keymap
+            .key_get_mods_for_level(keycode, layout, level, &mut masks);
+        masks[..found]
+            .iter()
+            .copied()
+            .min_by_key(|mask| mask.count_ones())
+    }
+
+    /// The modifier and layout state as the compositor should see it, with
+    /// `extra` merged into the depressed modifiers.
+    ///
+    /// Passing `0` restores what is actually held.
+    pub fn modifier_state(&self, extra: ModMask) -> (ModMask, ModMask, ModMask, LayoutMask) {
+        (
+            self.state.serialize_mods(STATE_MODS_DEPRESSED) | extra,
+            self.state.serialize_mods(STATE_MODS_LATCHED),
+            self.state.serialize_mods(STATE_MODS_LOCKED),
+            self.state.serialize_layout(STATE_LAYOUT_EFFECTIVE),
+        )
     }
 
     pub fn map_key(&mut self, key: Key) -> InputResult<u16> {
@@ -416,6 +500,7 @@ mod tests {
 
     use xkbcommon::xkb::{
         CONTEXT_NO_FLAGS, Context, KEYMAP_COMPILE_NO_FLAGS, KEYMAP_FORMAT_TEXT_V1, Keymap,
+        MOD_NAME_SHIFT,
     };
 
     use super::Keymap2;
@@ -444,13 +529,66 @@ mod tests {
         let key = Key::Unicode('汉');
         assert_eq!(keymap.key_to_keycode(key), None, "precondition: not mapped");
         let keycode = keymap.map_key(key).unwrap();
-        assert_eq!(keymap.key_to_keycode(key), Some(keycode));
+        assert_eq!(keymap.key_to_keycode(key).map(|(k, _)| k), Some(keycode));
 
         // A second mapping must not displace the first one.
         let key2 = Key::Unicode('语');
         let keycode2 = keymap.map_key(key2).unwrap();
         assert_ne!(keycode, keycode2);
-        assert_eq!(keymap.key_to_keycode(key), Some(keycode));
-        assert_eq!(keymap.key_to_keycode(key2), Some(keycode2));
+        assert_eq!(keymap.key_to_keycode(key).map(|(k, _)| k), Some(keycode));
+        assert_eq!(keymap.key_to_keycode(key2).map(|(k, _)| k), Some(keycode2));
+    }
+
+    // The bug this pins: `I` lives only on shift level 1 of the `i` key, so a
+    // lookup that reads level 0 alone reports it as absent. The caller then
+    // invents a keycode for it — one above 255, which X11 clients drop and
+    // Wayland clients race against the keymap upload — and the character
+    // silently disappears from the typed text. Uppercase letters and `?`/`!`
+    // must resolve to a key the layout already has, plus Shift.
+    #[test]
+    fn unit_shifted_characters_use_the_unshifted_key_plus_shift() {
+        let keymap = us_keymap();
+
+        let (lower, lower_mods) = keymap
+            .key_to_keycode(Key::Unicode('i'))
+            .expect("`i` is on the us layout");
+        assert_eq!(lower_mods, 0, "`i` needs no modifier");
+
+        // Shift specifically, not Caps: both reach level 1 of an alphabetic
+        // key, and `key_get_mods_for_level` offers both, but Caps is a locked
+        // modifier and sending it depressed is not how a keyboard types a
+        // capital.
+        let shift = 1 << keymap.keymap.mod_get_index(MOD_NAME_SHIFT);
+
+        for c in ['I', 'Z', '?', '!', ':', '"'] {
+            let (keycode, mods) = keymap
+                .key_to_keycode(Key::Unicode(c))
+                .unwrap_or_else(|| panic!("`{c}` is on the us layout, at a shift level"));
+            assert_eq!(mods, shift, "`{c}` must be typed with Shift held");
+            assert!(
+                keycode <= 255,
+                "`{c}` resolved to keycode {keycode}; above 255 is unrepresentable in X11"
+            );
+        }
+
+        // Same physical key as its lowercase twin, so no keymap upload is
+        // needed to type it.
+        let (upper, _) = keymap.key_to_keycode(Key::Unicode('I')).unwrap();
+        assert_eq!(upper, lower, "`I` is Shift plus the `i` key");
+    }
+
+    // Level 0 has to win. Searching keycode by keycode instead of level by
+    // level would let a key that needs Shift shadow an unmodified one that sits
+    // later in the keymap, so plain letters would start typing with Shift held.
+    #[test]
+    fn unit_unmodified_keys_win_over_shifted_ones() {
+        let keymap = us_keymap();
+
+        for c in ['a', 'z', '1', '9', '/', ';', '-', '=', ','] {
+            let (_, mods) = keymap
+                .key_to_keycode(Key::Unicode(c))
+                .unwrap_or_else(|| panic!("`{c}` is on the us layout"));
+            assert_eq!(mods, 0, "`{c}` is unshifted and must need no modifier");
+        }
     }
 }

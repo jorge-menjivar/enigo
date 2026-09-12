@@ -905,28 +905,54 @@ impl Keyboard for Con {
             .as_mut()
             .ok_or(InputError::Simulate("no keymap available"))?;
 
-        let keycode = if let Some(keycode) = keymap.key_to_keycode(key) {
-            keycode
-        } else {
-            debug!("keycode for key {key:?} was not found");
+        let (keycode, level_mods, held_mods) =
+            if let Some((keycode, level_mods)) = keymap.key_to_keycode(key) {
+                (keycode, level_mods, keymap.modifier_state(0))
+            } else {
+                debug!("keycode for key {key:?} was not found");
 
-            let mapping_res = keymap.map_key(key);
-            let keycode = match mapping_res {
-                Err(InputError::Mapping(_)) => {
-                    // Unmap and retry
-                    keymap.unmap_everything()?;
-                    keymap.map_key(key)?
-                }
+                let mapping_res = keymap.map_key(key);
+                let keycode = match mapping_res {
+                    Err(InputError::Mapping(_)) => {
+                        // Unmap and retry
+                        keymap.unmap_everything()?;
+                        keymap.map_key(key)?
+                    }
 
-                Ok(keycode) => keycode,
-                _ => return Err(InputError::Mapping("unable to map the key".to_string())),
+                    Ok(keycode) => keycode,
+                    _ => return Err(InputError::Mapping("unable to map the key".to_string())),
+                };
+
+                // Apply the new keymap if there were any changes
+                self.update_keymap()?;
+                (keycode, 0, (0, 0, 0, 0))
             };
 
-            // Apply the new keymap if there were any changes
-            self.update_keymap()?;
-            keycode
-        };
-        self.raw(keycode, direction)
+        if level_mods == 0 {
+            return self.raw(keycode, direction);
+        }
+
+        // The keysym sits on a shift level of a key the user already has, so
+        // hold that level's modifiers around the keystroke. The alternative —
+        // inventing a keycode for the shifted keysym and uploading a keymap for
+        // it — is what `map_key` does, and it costs a keycode above 255 that
+        // X11 clients cannot represent and Wayland clients race.
+        //
+        // A held key (`Press` without `Release`) keeps the modifiers down until
+        // its release, so anything typed in between is modified too. That
+        // matches a physically held Shift, and `Click` — the direction text
+        // entry uses — never leaves them down.
+        let (depressed, latched, locked, layout) = held_mods;
+        if direction == Direction::Press || direction == Direction::Click {
+            self.send_modifier_event(depressed | level_mods, latched, locked, layout)?;
+        }
+        let key_res = self.raw(keycode, direction);
+        if direction == Direction::Release || direction == Direction::Click {
+            // Drop the modifiers even if the key itself failed: leaving Shift
+            // down on the compositor would modify everything typed afterwards.
+            self.send_modifier_event(depressed, latched, locked, layout)?;
+        }
+        key_res
     }
 
     fn raw(&mut self, keycode: u16, direction: Direction) -> InputResult<()> {
