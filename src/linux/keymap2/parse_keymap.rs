@@ -19,6 +19,11 @@ use crate::InputError;
 
 type Keycode = u32;
 
+/// The highest keycode the X11 protocol can carry (`KEYCODE` is a `CARD8`).
+/// `XWayland` silently drops key events above it, so an invented key has to
+/// sit at or below this to reach an X11 client at all.
+const MAX_X11_KEYCODE: Keycode = 255;
+
 pub trait Parse {
     fn parse(input: &str) -> IResult<&str, Self>
     where
@@ -35,72 +40,130 @@ pub struct ParsedKeymap {
     symbols: Symbols,
     // Don't parse this, just keep it as is
     geometry: Option<String>,
+    /// Keys `map_key` has bound in this keymap, so a stolen key is not stolen
+    /// twice. Rebuilt empty with the keymap, which is what returns them.
+    handed_out: Vec<Identifier>,
 }
 
 impl ParsedKeymap {
-    // TODO: Add tests for this function
-    /// Try to find an unused keycode and identifier to map the provided keyname
-    /// to. Returns the keycode the key is now mapped to
+    /// Bind `key_name` to a keycode X11 can carry and return that keycode.
+    ///
+    /// The keycode is taken from the keymap as it stands, never invented:
+    /// first a key that is named but has no symbols bound (every layout
+    /// xkeyboard-config ships leaves at least twelve of those under 256, the
+    /// `<I1xx>` reserved evdev codes among them), then one of the keys nobody
+    /// presses mid-sentence — F13 to F24, the media keys — whose binding is
+    /// overwritten for the life of this keymap and comes back with the
+    /// original one.
     ///
     /// # Errors
-    /// The function fails if no unused keycode can be found or if all
-    /// identifiers from <0000> to <9999> are already used
-    pub fn map_key(&mut self, key_name: &str, is_wayland: bool) -> crate::InputResult<u16> {
-        // Even if the mimimum is 8, never use 8. This is because 8 is special. 8-8=0
-        // and the value 0 stands for "NoSymbol". Some clients disregard the keymap and
-        // always interpret keycode 8 as NoSymbol.
-        let minimum = self.keycodes.minimum.max(9);
-        // Maximum on X11 is 255, but on Wayland we can use keycodes up to u16::MAX
-        let maximum = if is_wayland { u16::MAX as u32 } else { 255 };
+    /// When neither kind of key is available. This deliberately does not fall
+    /// back to a keycode above 255: X11 carries keycodes in a single byte, so
+    /// `XWayland` discards anything larger and the character silently never
+    /// arrives. An error here is the one signal the caller gets.
+    pub fn map_key(&mut self, key_name: &str, held: &HashSet<Keycode>) -> crate::InputResult<u16> {
+        let identifier = self
+            .unbound_identifier(held)
+            .or_else(|| self.stealable_identifier(held))
+            .ok_or_else(|| {
+                InputError::Mapping(format!(
+                    "no keycode at or below {MAX_X11_KEYCODE} is free or stealable for {key_name}; \
+                     refusing to invent one above it, which X11 clients would discard"
+                ))
+            })?;
+        let code = self
+            .keycodes
+            .keycode_mappings
+            .iter()
+            .find(|entry| entry.identifier == identifier)
+            .map(|entry| entry.code)
+            .expect("identifier was taken from the keycode mappings");
 
-        // Find an unused keycode
-        let free_keycode_u32 = (minimum..maximum)
-            .find(|raw| {
-                !self
-                    .keycodes
-                    .keycode_mappings
-                    .iter()
-                    .any(|entry| *raw == entry.code)
-            })
-            .ok_or_else(|| InputError::Mapping("no available keycode".to_string()))?;
-        let free_keycode_u16 = u16::try_from(free_keycode_u32)
-            .map_err(|_| InputError::Mapping("the available keycode exceeds u16::MAX".to_string()));
+        // Two identical levels rather than one: a one-level key with a letter on
+        // it gets the ALPHABETIC type inferred, and Caps Lock would then flip it.
+        let symbols = format!("{{\t[ {key_name}, {key_name} ] }}");
+        match self
+            .symbols
+            .keys
+            .iter_mut()
+            .find(|(existing, _)| *existing == identifier)
+        {
+            Some(entry) => entry.1 = symbols, // stolen: overwrite the binding
+            None => self.symbols.keys.push((identifier.clone(), symbols)),
+        }
+        self.handed_out.push(identifier);
 
-        // Find an unused identifier
-        let free_identifier = (0..=9999)
-            .rev()
-            .map(|idx| format!("{idx:0>4}"))
-            .filter(|potential_identifier_name| {
-                !self
-                    .keycodes
-                    .keycode_mappings
-                    .iter()
-                    .any(|entry| *potential_identifier_name == entry.identifier.identifier)
-            })
-            .find(|potential_identifier_name| {
-                !self
-                    .symbols
-                    .keys
-                    .iter()
-                    .any(|(identifier, _)| *potential_identifier_name == identifier.identifier)
-            })
-            .ok_or_else(|| InputError::Mapping("no available identifier".to_string()))?;
-        let free_identifier = Identifier {
-            identifier: free_identifier,
+        u16::try_from(code).map_err(|_| {
+            InputError::Mapping("the chosen keycode does not fit in a u16".to_string())
+        })
+    }
+
+    /// Identifiers that some symbols entry binds, aliases resolved: `key <X>`
+    /// binds the canonical key `<X>` is an alias for.
+    fn bound_identifiers(&self) -> HashSet<&Identifier> {
+        let mut bound: HashSet<&Identifier> = self.symbols.keys.iter().map(|(id, _)| id).collect();
+        for AliasEntry { alias, name } in &self.keycodes.aliases {
+            if bound.contains(alias) {
+                bound.insert(name);
+            }
+        }
+        bound
+    }
+
+    /// The lowest keycode X11 can carry that is named but has nothing bound.
+    fn unbound_identifier(&self, held: &HashSet<Keycode>) -> Option<Identifier> {
+        let bound = self.bound_identifiers();
+        self.keycodes
+            .keycode_mappings
+            .iter()
+            .filter(|entry| Self::x11_usable(entry.code) && !held.contains(&entry.code))
+            .filter(|entry| !bound.contains(&entry.identifier))
+            .filter(|entry| !self.handed_out.contains(&entry.identifier))
+            .min_by_key(|entry| entry.code)
+            .map(|entry| entry.identifier.clone())
+    }
+
+    /// A bound key whose binding can be sacrificed: F13 to F24 first, then the
+    /// `<Ixxx>` internet/media keys. Never a letter, digit, or modifier — losing
+    /// those would break the text this is being asked to type.
+    fn stealable_identifier(&self, held: &HashSet<Keycode>) -> Option<Identifier> {
+        let rank = |id: &str| -> Option<u8> {
+            if let Some(n) = id.strip_prefix("FK").and_then(|n| n.parse::<u8>().ok()) {
+                return (n >= 13).then_some(0);
+            }
+            let media_key =
+                id.len() > 1 && id.starts_with('I') && id[1..].chars().all(|c| c.is_ascii_digit());
+            media_key.then_some(1)
         };
+        self.keycodes
+            .keycode_mappings
+            .iter()
+            .filter(|entry| Self::x11_usable(entry.code) && !held.contains(&entry.code))
+            .filter(|entry| !self.handed_out.contains(&entry.identifier))
+            .filter_map(|entry| rank(&entry.identifier.identifier).map(|r| (r, entry)))
+            .min_by_key(|(r, entry)| (*r, entry.code))
+            .map(|(_, entry)| entry.identifier.clone())
+    }
 
-        // Add free identifier and keycode to keymap
-        self.keycodes.keycode_mappings.push(KeycodeEntry {
-            identifier: free_identifier.clone(),
-            code: free_keycode_u32,
-        });
+    /// Names of the keys `map_key` would hand out before stealing any: named,
+    /// nothing bound, and within what X11 can carry. Exposed so a test can pin
+    /// how many a stock layout leaves free.
+    #[cfg(test)]
+    pub(super) fn free_key_names(&self) -> Vec<String> {
+        let bound = self.bound_identifiers();
+        self.keycodes
+            .keycode_mappings
+            .iter()
+            .filter(|entry| Self::x11_usable(entry.code) && !bound.contains(&entry.identifier))
+            .map(|entry| entry.identifier.identifier.clone())
+            .collect()
+    }
 
-        let symbols_string = format!("{{\t[ {key_name}, {key_name} ] }}");
-        self.symbols.keys.push((free_identifier, symbols_string));
-
-        // Update the maximum if it is needed
-        self.keycodes.maximum = self.keycodes.maximum.max(free_keycode_u32);
-        free_keycode_u16
+    /// Keycodes an X11 client can receive. 8 is excluded on top of the X11
+    /// ceiling: it is evdev 0, which some clients read as `NoSymbol` regardless
+    /// of the keymap.
+    fn x11_usable(code: Keycode) -> bool {
+        (9..=MAX_X11_KEYCODE).contains(&code)
     }
 
     pub fn copy_maps_for_keycodes(
@@ -147,15 +210,21 @@ impl ParsedKeymap {
             .filter(|(identifier, _)| identifiers.contains(&identifier))
             .collect();
 
-        // Add the found entries to the keymap, but only if they are not in it already
+        // Carry each held key's binding over. The keycode entry is usually
+        // already present — a pooled key is one the keymap always had — so the
+        // symbols are what matter, and an existing entry is overwritten rather
+        // than duplicated.
         for keycode_entry in keycode_entrys {
-            if !self.keycodes.keycode_mappings.contains(&keycode_entry) {
-                let symbols_entry = key_entrys
-                    .iter()
-                    .find(|(i, _)| *i == keycode_entry.identifier);
-                if let Some(symbols_entry) = symbols_entry {
-                    self.symbols.keys.push((*symbols_entry).clone());
+            if let Some((id, def)) = key_entrys
+                .iter()
+                .find(|(i, _)| *i == keycode_entry.identifier)
+            {
+                match self.symbols.keys.iter_mut().find(|(i, _)| i == id) {
+                    Some(existing) => existing.1.clone_from(def),
+                    None => self.symbols.keys.push((id.clone(), def.clone())),
                 }
+            }
+            if !self.keycodes.keycode_mappings.contains(&keycode_entry) {
                 self.keycodes.keycode_mappings.push(keycode_entry);
             }
         }
@@ -230,6 +299,7 @@ impl Parse for ParsedKeymap {
                 compatibility,
                 symbols,
                 geometry,
+                handed_out: Vec::new(),
             },
         ))
     }
@@ -401,7 +471,7 @@ impl Parse for Name {
     }
 }
 
-#[derive(Debug, PartialEq, PartialOrd, Ord, Eq, Clone)]
+#[derive(Debug, PartialEq, PartialOrd, Ord, Eq, Clone, Hash)]
 struct Identifier {
     identifier: String,
 }

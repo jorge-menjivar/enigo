@@ -354,7 +354,10 @@ impl Keymap2 {
             Some(key_name) => key_name,
             None => &key_name,
         };
-        let keycode = self.parsed_keymap.map_key(key_name, true)?;
+        // A held key must keep its identity until it is released, so it is
+        // neither handed out as free nor stolen.
+        let held: HashSet<u32> = self.pressed_keys.iter().map(|k| k.raw()).collect();
+        let keycode = self.parsed_keymap.map_key(key_name, &held)?;
         self.recompile().map_err(|()| {
             InputError::Mapping("unable to compile the updated keymap".to_string())
         })?;
@@ -575,6 +578,80 @@ mod tests {
         // needed to type it.
         let (upper, _) = keymap.key_to_keycode(Key::Unicode('I')).unwrap();
         assert_eq!(upper, lower, "`I` is Shift plus the `i` key");
+    }
+
+    // Off-layout characters get a key the keymap already names, never one
+    // invented above 255: X11 carries keycodes in a byte, so XWayland drops
+    // anything larger and the character silently never arrives. Typed into
+    // xterm, `I think I am OK at NASA` landed as ` think  am  at ` for exactly
+    // this reason. The pool is finite; when it and the stealable keys are gone
+    // the error has to say so, and unmapping has to start it over.
+    #[test]
+    fn unit_off_layout_characters_get_keycodes_x11_can_carry() {
+        let mut keymap = us_keymap();
+        // More distinct CJK characters than there are keycodes under 256, so
+        // the pool — free keys, then stealable ones — must run dry.
+        let chars: Vec<char> = ('\u{4e00}'..).take(300).collect();
+
+        let mut mapped = Vec::new();
+        let mut exhausted = None;
+        for &c in &chars {
+            match keymap.map_key(Key::Unicode(c)) {
+                Ok(keycode) => {
+                    assert!(keycode <= 255, "{c} got keycode {keycode}, above 255");
+                    assert!(!mapped.contains(&keycode), "{c} reused keycode {keycode}");
+                    assert_eq!(
+                        keymap.key_to_keycode(Key::Unicode(c)),
+                        Some((keycode, 0)),
+                        "{c} must be found where it was mapped, with no modifier"
+                    );
+                    mapped.push(keycode);
+                }
+                Err(e) => {
+                    exhausted = Some(e.to_string());
+                    break;
+                }
+            }
+        }
+        assert!(
+            mapped.len() >= 14,
+            "a stock us layout leaves at least 14 keys free, got {}",
+            mapped.len()
+        );
+        let err = exhausted.expect("300 characters must exhaust the pool");
+        assert!(
+            err.contains("255"),
+            "the error must name the ceiling: {err}"
+        );
+
+        // Unmapping returns the pool, and the next mapping is under 255 again.
+        keymap.unmap_everything().unwrap();
+        let again = keymap.map_key(Key::Unicode('\u{4e00}')).unwrap();
+        assert!(again <= 255);
+    }
+
+    // CI canary for xkeyboard-config. Every layout it ships leaves the ten
+    // reserved `<I1xx>` evdev keys unbound (their only mention in the symbols
+    // data is commented out), which is what makes a fresh keymap always have
+    // room. If an upstream release binds them, this fails here instead of in
+    // someone's editor.
+    #[test]
+    fn unit_stock_layout_leaves_the_reserved_keys_free() {
+        let keymap = us_keymap();
+        let free = keymap.parsed_keymap.free_key_names();
+        assert!(
+            free.len() >= 10,
+            "only {} free keys under 256: {free:?}",
+            free.len()
+        );
+        for reserved in [
+            "I120", "I149", "I154", "I168", "I178", "I183", "I184", "I222", "I230", "I248",
+        ] {
+            assert!(
+                free.iter().any(|n| n == reserved),
+                "<{reserved}> is bound on a stock us layout; free: {free:?}"
+            );
+        }
     }
 
     // Level 0 has to win. Searching keycode by keycode instead of level by
