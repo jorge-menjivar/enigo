@@ -347,6 +347,34 @@ impl Keymap2 {
         )
     }
 
+    /// The keys that hold down `mods`: for each modifier in it, the lowest
+    /// keycode whose press sets exactly that modifier, as `Shift_L` sets Shift.
+    ///
+    /// `None` when some modifier in `mods` has no such key on this keymap.
+    pub fn modifier_keycodes(&self, mods: ModMask) -> Option<Vec<u16>> {
+        let min = self.keymap.min_keycode().raw();
+        let max = self.keymap.max_keycode().raw();
+        (0..ModMask::BITS)
+            .map(|index| 1 << index)
+            .filter(|bit| mods & bit != 0)
+            .map(|bit| {
+                let raw = (min..=max).find(|&raw| {
+                    let keycode = Keycode::new(raw);
+                    // A key held for the caller is not ours to press and release.
+                    if self.pressed_keys.contains(&keycode) {
+                        return false;
+                    }
+                    // A fresh state each time: a lock or latch key would leave
+                    // a shared one changed.
+                    let mut state = State::new(&self.keymap);
+                    state.update_key(keycode, KeyDirection::Down);
+                    state.serialize_mods(STATE_MODS_DEPRESSED) == bit
+                })?;
+                u16::try_from(raw).ok()
+            })
+            .collect()
+    }
+
     pub fn map_key(&mut self, key: Key) -> InputResult<u16> {
         let keysym = Keysym::from(key);
         let key_name = format!("{keysym:?}");
@@ -652,6 +680,28 @@ mod tests {
                 "<{reserved}> is bound on a stock us layout; free: {free:?}"
             );
         }
+    }
+
+    // The keys pressed around a shifted character. Shift must come out as
+    // `Shift_L`, a key every keyboard has, and a modifier the keymap has no
+    // key for must say so rather than press something else.
+    #[test]
+    fn unit_level_modifiers_are_found_on_their_keys() {
+        let keymap = us_keymap();
+        let shift = 1 << keymap.keymap.mod_get_index(MOD_NAME_SHIFT);
+        let shift_l = keymap.keymap.key_by_name("LFSH").unwrap().raw();
+
+        assert_eq!(
+            keymap.modifier_keycodes(shift),
+            Some(vec![u16::try_from(shift_l).unwrap()]),
+            "Shift is held with `Shift_L`"
+        );
+        assert_eq!(keymap.modifier_keycodes(0), Some(vec![]), "nothing to hold");
+        assert_eq!(
+            keymap.modifier_keycodes(1 << 31),
+            None,
+            "a modifier the keymap does not define has no key"
+        );
     }
 
     // Level 0 has to win. Searching keycode by keycode instead of level by

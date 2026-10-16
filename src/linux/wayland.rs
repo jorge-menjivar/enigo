@@ -905,9 +905,16 @@ impl Keyboard for Con {
             .as_mut()
             .ok_or(InputError::Simulate("no keymap available"))?;
 
-        let (keycode, level_mods, held_mods) =
+        let (keycode, level_mods, held_mods, level_keys) =
             if let Some((keycode, level_mods)) = keymap.key_to_keycode(key) {
-                (keycode, level_mods, keymap.modifier_state(0))
+                let held_mods = keymap.modifier_state(0);
+                // Keys only for the modifiers not held already: pressing and
+                // releasing a held one would let go of the caller's hold.
+                // Without a key for each, the request below carries them alone.
+                let level_keys = keymap
+                    .modifier_keycodes(level_mods & !held_mods.0)
+                    .unwrap_or_default();
+                (keycode, level_mods, held_mods, level_keys)
             } else {
                 debug!("keycode for key {key:?} was not found");
 
@@ -925,7 +932,7 @@ impl Keyboard for Con {
 
                 // Apply the new keymap if there were any changes
                 self.update_keymap()?;
-                (keycode, 0, (0, 0, 0, 0))
+                (keycode, 0, (0, 0, 0, 0), Vec::new())
             };
 
         if level_mods == 0 {
@@ -942,15 +949,36 @@ impl Keyboard for Con {
         // its release, so anything typed in between is modified too. That
         // matches a physically held Shift, and `Click` — the direction text
         // entry uses — never leaves them down.
+        //
+        // The modifiers go out twice: as the `modifiers` request, and as
+        // presses of the keys that set them (`Shift_L` for Shift), the way a
+        // physical keyboard sends them. Compositors on smithay before its
+        // virtual keyboard rework (Smithay/smithay#2159) pass the request
+        // straight to the client and act on nothing else. Those after it, such
+        // as cosmic-comp 1.10, swap in this keyboard's keymap on the first key
+        // after another keyboard was used, and the swap drops a requested mask
+        // without telling the client. The client then keeps Shift until the
+        // next modifier change: `I am testing` arrived as `I AM TESTING`. Held
+        // keys survive the swap, so with both the client gets Shift and its
+        // release either way.
         let (depressed, latched, locked, layout) = held_mods;
         if direction == Direction::Press || direction == Direction::Click {
             self.send_modifier_event(depressed | level_mods, latched, locked, layout)?;
+            for &level_key in &level_keys {
+                self.send_key_event(level_key.into(), Direction::Press)?;
+            }
         }
         let key_res = self.raw(keycode, direction);
         if direction == Direction::Release || direction == Direction::Click {
             // Drop the modifiers even if the key itself failed: leaving Shift
             // down on the compositor would modify everything typed afterwards.
+            let mut release_res = Ok(());
+            for &level_key in level_keys.iter().rev() {
+                release_res =
+                    release_res.and(self.send_key_event(level_key.into(), Direction::Release));
+            }
             self.send_modifier_event(depressed, latched, locked, layout)?;
+            release_res?;
         }
         key_res
     }
